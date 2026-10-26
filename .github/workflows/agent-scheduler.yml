@@ -1,0 +1,126 @@
+name: 🤖 Repository Maintenance Agent
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Triggers
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  schedule:
+    # Anchor: 02:00 UTC daily. A random 0-6 h jitter is applied in-job,
+    # so the effective run window is 02:00–08:00 UTC (unpredictable per day).
+    - cron: '0 2 * * *'
+
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — audit only, no commits'
+        required: false
+        default: 'false'
+        type: boolean
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Minimal default permissions (elevated via the App token below)
+# ──────────────────────────────────────────────────────────────────────────────
+permissions:
+  contents: read
+
+concurrency:
+  group: maintenance-agent
+  cancel-in-progress: false   # never cancel a running audit mid-way
+
+jobs:
+  maintenance:
+    name: Run Maintenance Agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 20       # hard cap — prevents runaway billing
+
+    steps:
+      # ── 1. Daily random jitter ──────────────────────────────────────────────
+      - name: ⏱ Apply random jitter (0–6 h)
+        if: github.event_name == 'schedule'
+        run: |
+          SLEEP_SEC=$(( RANDOM % 21600 ))
+          echo "Sleeping ${SLEEP_SEC}s \
+            (~$(( SLEEP_SEC / 3600 ))h $(( (SLEEP_SEC % 3600) / 60 ))m)"
+          sleep "${SLEEP_SEC}"
+
+      # ── 2. Mint an ephemeral bot token ──────────────────────────────────────
+      - name: 🔑 Generate bot installation token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          # Scope the token to this repository only
+          repositories: ${{ github.event.repository.name }}
+
+      # ── 3. Checkout ─────────────────────────────────────────────────────────
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0          # full history for branch-age analysis
+
+      # ── 4. Python runtime ───────────────────────────────────────────────────
+      - name: 🐍 Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 📦 Install agent dependencies
+        run: pip install requests==2.32.*
+
+      # ── 5. Bot Git identity ─────────────────────────────────────────────────
+      - name: 🤖 Configure bot Git identity
+        run: |
+          git config user.name  "project-maintenance-agent[bot]"
+          git config user.email \
+            "project-maintenance-agent[bot]@users.noreply.github.com"
+
+      # ── 6. Run the agent ────────────────────────────────────────────────────
+      - name: 🔍 Run maintenance agent
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO:         ${{ github.repository }}
+          DRY_RUN:      ${{ inputs.dry_run || 'false' }}
+        run: python scripts/maintenance_agent.py
+
+      # ── 7. Detect meaningful changes ────────────────────────────────────────
+      - name: 📊 Check for changes
+        id: diff
+        run: |
+          git add -A
+          if git diff --staged --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "✅ No meaningful changes — skipping commit."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "📝 Staged changes:"
+            git diff --staged --stat
+          fi
+
+      # ── 8. Commit & push (only when real diffs exist) ───────────────────────
+      - name: 🚀 Commit and push
+        if: steps.diff.outputs.changed == 'true' && inputs.dry_run != 'true'
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          git commit -m "chore(bot): update repo health report [${TIMESTAMP}]
+
+          Automated maintenance run by project-maintenance-agent[bot].
+
+          Co-authored-by: project-maintenance-agent[bot] \
+            <project-maintenance-agent[bot]@users.noreply.github.com>"
+          git push
+
+      # ── 9. Summary ──────────────────────────────────────────────────────────
+      - name: 📋 Write job summary
+        if: always()
+        run: |
+          echo "## 🤖 Maintenance Agent Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Run at | $(date -u) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Dry run | ${{ inputs.dry_run || 'false' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Changes committed | ${{ steps.diff.outputs.changed }} |" \
+            >> "$GITHUB_STEP_SUMMARY"
